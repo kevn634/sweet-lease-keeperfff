@@ -17,12 +17,10 @@ type AuthCtx = {
   session:       AppSession;
   ownerUser:     User | null;
   loading:       boolean;
-  // Owner auth (Supabase)
   register:      (email: string, password: string) => Promise<{ error: string | null }>;
   loginOwner:    (email: string, password: string) => Promise<{ error: string | null }>;
   forgotPassword:(email: string)                   => Promise<{ error: string | null }>;
   logout:        ()                                => Promise<void>;
-  // Tenant auth (secret code lookup, no Supabase Auth)
   loginTenant:   (tenantId: string) => void;
   logoutTenant:  () => void;
 };
@@ -32,32 +30,56 @@ const AuthContext = createContext<AuthCtx | null>(null);
 
 // ─── Provider ────────────────────────────────────────────────
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [ownerUser,    setOwnerUser]    = useState<User | null>(null);
+  const [ownerUser,     setOwnerUser]     = useState<User | null>(null);
   const [tenantSession, setTenantSession] = useState<TenantSession | null>(null);
-  const [loading,      setLoading]      = useState(true);
+  const [loading,       setLoading]       = useState(true);
 
-  // Restore Supabase owner session on mount
+  // Restore Supabase owner session on mount — guarded against SSR
   useEffect(() => {
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      setOwnerUser(session?.user ?? null);
-      setLoading(false);
-    });
+    let cancelled = false;
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(
-      (_event, session: Session | null) => {
-        setOwnerUser(session?.user ?? null);
-        setLoading(false);
-      }
-    );
-    return () => subscription.unsubscribe();
-  }, []);
-
-  // Restore tenant session from localStorage
-  useEffect(() => {
+    // Restore tenant session from localStorage
     try {
       const raw = localStorage.getItem(TENANT_KEY);
       if (raw) setTenantSession(JSON.parse(raw));
     } catch {}
+
+    // Get Supabase session with 5-second safety timeout
+    const timeout = setTimeout(() => {
+      if (!cancelled) setLoading(false);
+    }, 5000);
+
+    supabase.auth
+      .getSession()
+      .then(({ data: { session } }) => {
+        if (!cancelled) {
+          setOwnerUser(session?.user ?? null);
+          setLoading(false);
+          clearTimeout(timeout);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setLoading(false);
+          clearTimeout(timeout);
+        }
+      });
+
+    // Listen for auth state changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, session: Session | null) => {
+        if (!cancelled) {
+          setOwnerUser(session?.user ?? null);
+          setLoading(false);
+        }
+      }
+    );
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+      subscription.unsubscribe();
+    };
   }, []);
 
   // ─── Owner Auth helpers ───────────────────────────────────
